@@ -1,178 +1,188 @@
 #!/usr/bin/env python3
 """
-Script para avaliar SOMENTE o PPO no ambiente DSSE Coverage
+Script para avaliar o modelo PPO treinado no ambiente DSSE Coverage
+Compatível com modelos do stable-baselines3
 """
 
 import os
 import numpy as np
-import torch
 import pandas as pd
 from tqdm import tqdm
-from DSSE import CoverageDroneSwarmSearch
-from agent import PPOAgent
+from stable_baselines3 import PPO
+from train import DSSECoverageEnv
 from utils import create_directories, plot_learning_curves
 
-def evaluate_ppo(agents, drones_positions, num_episodes=10, render=False):
-    """Avalia agentes PPO treinados e coleta métricas detalhadas"""
+def evaluate_ppo_model(model_path, num_drones=2, num_episodes=10, render=False):
+    """Avalia um modelo PPO treinado com stable-baselines3"""
+    # Criar ambiente de avaliação
+    env_kwargs = {
+        "disaster_position": (-24.04, -46.17),
+        "pre_render_time": 2
+    }
+    
     render_mode = "human" if render else "ansi"
-    env = CoverageDroneSwarmSearch(
-        drone_amount=len(agents),
+    env = DSSECoverageEnv(
+        drone_amount=num_drones,
         render_mode=render_mode,
-        disaster_position=(-24.04, -46.17),
-        pre_render_time=2
+        **env_kwargs
     )
     
-    episodic_metrics = {
+    # Carregar modelo treinado
+    model = PPO.load(model_path)
+    print(f"Modelo carregado: {model_path}")
+    
+    # Métricas para avaliação
+    metrics = {
         'reward': [],
         'steps': [],
         'coverage_rate': [],
         'cumulative_pos': [],
         'repeated_coverage': []
     }
-    detailed_metrics = {
+    
+    # Dados detalhados por passo
+    detailed = {
         'reward': [],
         'coverage_rate': [],
         'cumulative_pos': [],
         'repeated_coverage': []
     }
     
-    for _ in tqdm(range(num_episodes), desc="Avaliando PPO"):
-        options = {"drones_positions": drones_positions}
-        observations, _ = env.reset(options=options)
-        
-        # formatar obs
-        obs_dict = {
-            drone_id: (np.array(pos, dtype=np.float32), pmatrix)
-            for drone_id, (pos, pmatrix) in observations.items()
-        }
-        
+    # Executar avaliação
+    for ep in tqdm(range(num_episodes), desc="Avaliando modelo"):
+        obs = env.reset()
+        done = False
         ep_reward = 0
         ep_steps = 0
-        done = False
-        last_cov = last_rep = last_cum = 0
+        
+        # Valores para acompanhamento
+        last_cov = 0
+        last_rep = 0
+        last_cum = 0
         
         while not done:
-            # escolher ações
-            actions = {
-                drone_id: agent.act(obs_dict[drone_id], training=False)
-                for drone_id, agent in agents.items()
-                if drone_id in env.agents
-            }
-            observations, rewards, terminations, truncations, infos = env.step(actions)
+            # Predizer ação determinística
+            action, _ = model.predict(obs, deterministic=True)
             
-            # atualizar obs
-            for drone_id, (pos, pmatrix) in observations.items():
-                obs_dict[drone_id] = (np.array(pos, dtype=np.float32), pmatrix)
+            # Executar passo
+            obs, reward, done, info = env.step(action)
             
-            step_reward = sum(rewards.values())
-            ep_reward += step_reward
+            # Registrar recompensa
+            ep_reward += reward
             ep_steps += 1
             
-            # detalhado por passo
-            detailed_metrics['reward'].append(step_reward)
-            for info in infos.values():
-                if 'coverage_rate' in info:
-                    last_cov = info['coverage_rate']
-                    detailed_metrics['coverage_rate'].append(last_cov)
-                if 'repeated_coverage' in info:
-                    last_rep = info['repeated_coverage']
-                    detailed_metrics['repeated_coverage'].append(last_rep)
-                if 'accumulated_pos' in info:
-                    last_cum = info['accumulated_pos']
-                    detailed_metrics['cumulative_pos'].append(last_cum)
-                break
+            # Registrar métricas detalhadas
+            detailed['reward'].append(reward)
             
-            done = any(terminations.values()) or any(truncations.values()) or not env.agents
+            # Extrair métricas de cobertura dos drones
+            if 'drones_info' in info:
+                for drone_info in info['drones_info'].values():
+                    if 'coverage_rate' in drone_info:
+                        last_cov = drone_info['coverage_rate']
+                        detailed['coverage_rate'].append(last_cov)
+                    if 'repeated_coverage' in drone_info:
+                        last_rep = drone_info['repeated_coverage']
+                        detailed['repeated_coverage'].append(last_rep)
+                    if 'accumulated_pos' in drone_info:
+                        last_cum = drone_info['accumulated_pos']
+                        detailed['cumulative_pos'].append(last_cum)
+                    break  # Apenas um drone é suficiente para as métricas
         
-        episodic_metrics['reward'].append(ep_reward)
-        episodic_metrics['steps'].append(ep_steps)
-        episodic_metrics['coverage_rate'].append(last_cov)
-        episodic_metrics['repeated_coverage'].append(last_rep)
-        episodic_metrics['cumulative_pos'].append(last_cum)
+        # Registrar métricas do episódio
+        metrics['reward'].append(ep_reward)
+        metrics['steps'].append(ep_steps)
+        metrics['coverage_rate'].append(last_cov)
+        metrics['repeated_coverage'].append(last_rep)
+        metrics['cumulative_pos'].append(last_cum)
+        
+        if render:
+            print(f"Episódio {ep+1}: Reward={ep_reward:.2f}, Steps={ep_steps}, Coverage={last_cov:.2f}%")
     
+    # Fechar ambiente
     env.close()
-    return episodic_metrics, detailed_metrics
+    
+    # Resultado em formato compatível com plot_learning_curves
+    results = {'PPO': detailed}
+    episodic_results = {'PPO': metrics}
+    
+    return episodic_results, results
 
-
-def compare_algorithms(agents_dir, num_drones=2, num_episodes=100,
-                       render=False, results_dir="./results"):
-    """Carrega somente PPO e gera curvas de aprendizado"""
+def compare_algorithms(agents_dir, num_drones=2, num_episodes=100, render=False, results_dir="./results"):
+    """Carrega e avalia o modelo PPO treinado"""
     create_directories([results_dir])
     
-    # pegar posições iniciais
-    temp_env = CoverageDroneSwarmSearch(
-        drone_amount=num_drones,
-        render_mode="ansi",
-        disaster_position=(-24.04, -46.17),
-        pre_render_time=2
+    # Encontrar o modelo mais recente
+    model_files = [f for f in os.listdir(agents_dir) if f.endswith('.zip')]
+    if not model_files:
+        print(f"Nenhum modelo encontrado em {agents_dir}")
+        return None, None
+    
+    # Usar o modelo mais recente (com timestamp maior)
+    model_path = os.path.join(agents_dir, sorted(model_files)[-1])
+    print(f"Usando o modelo: {model_path}")
+    
+    # Avaliar modelo
+    episodic_results, detailed_results = evaluate_ppo_model(
+        model_path,
+        num_drones=num_drones,
+        num_episodes=num_episodes,
+        render=render
     )
-    grid = temp_env.grid_size
-    prob = temp_env.probability_matrix.get_matrix()
-    temp_env.close()
-    valid = [(x, y) for y in range(grid) for x in range(grid) if prob[y, x] > 0]
-    drones_pos = (valid[:num_drones]
-                  if len(valid) >= num_drones
-                  else valid * ((num_drones + len(valid) - 1) // len(valid)))
     
-    # carregar agentes PPO
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    agents = {}
-    for i in range(num_drones):
-        aid = f"drone{i}"
-        latest = None
-        best_ep = -1
-        for f in os.listdir(agents_dir):
-            if f.startswith(aid) and f.endswith(".pt"):
-                try:
-                    ep = int(f.split("ep")[-1].split(".")[0])
-                except:
-                    continue
-                if ep > best_ep:
-                    best_ep = ep
-                    latest = f
-        if latest:
-            agents[aid] = PPOAgent.create_from_checkpoint(
-                os.path.join(agents_dir, latest), device=device
-            )
-        else:
-            agents[aid] = PPOAgent(
-                obs_shape=(grid, grid),
-                action_size=8,
-                device=device
-            )
-    
-    # roda só o PPO
-    episodic, detailed = evaluate_ppo(agents, drones_pos, num_episodes, render)
-    
-    # **Aqui** embrulhamos em um nível extra para satisfazer plot_learning_curves
-    episodic_results = {'PPO': episodic}
-    detailed_results = {'PPO': detailed}
-    
-    # Gerar curvas de aprendizado com a nova função
+    # Gerar curvas de aprendizado
     for metric in ['reward', 'coverage_rate', 'repeated_coverage', 'cumulative_pos']:
-        plot_learning_curves(
-            detailed_results,
-            metric,
-            os.path.join(results_dir, f"learning_curve_{metric}.png")
-        )
+        if metric in detailed_results['PPO']:
+            plot_learning_curves(
+                detailed_results,
+                metric,
+                os.path.join(results_dir, f"learning_curve_{metric}.png")
+            )
     
-    # Salvar CSV
+    # Salvar resultados como CSV
     rows = []
-    for metric_name, vals in episodic.items():
+    for metric_name, vals in episodic_results['PPO'].items():
         for i, v in enumerate(vals):
-            rows.append({'algorithm': 'PPO',
-                         'episode': i,
-                         'metric': metric_name,
-                         'value': v})
-    for metric_name, vals in detailed.items():
+            rows.append({
+                'algorithm': 'PPO',
+                'episode': i,
+                'metric': metric_name,
+                'value': v
+            })
+    
+    for metric_name, vals in detailed_results['PPO'].items():
         for i, v in enumerate(vals):
-            rows.append({'algorithm': 'PPO',
-                         'step': i,
-                         'metric': metric_name,
-                         'value': v})
+            rows.append({
+                'algorithm': 'PPO',
+                'step': i,
+                'metric': metric_name,
+                'value': v
+            })
+    
     pd.DataFrame(rows).to_csv(
         os.path.join(results_dir, "detailed_results.csv"),
         index=False
     )
     
+    print(f"Avaliação concluída. Resultados salvos em {results_dir}")
     return episodic_results, detailed_results
+
+if __name__ == "__main__":
+    # Testar diretamente
+    import argparse
+    
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--models_dir", default="./models")
+    parser.add_argument("--results_dir", default="./results")
+    parser.add_argument("--num_drones", type=int, default=4)
+    parser.add_argument("--num_episodes", type=int, default=10)
+    parser.add_argument("--render", action="store_true")
+    
+    args = parser.parse_args()
+    
+    compare_algorithms(
+        args.models_dir,
+        num_drones=args.num_drones,
+        num_episodes=args.num_episodes,
+        render=args.render,
+        results_dir=args.results_dir
+    )
